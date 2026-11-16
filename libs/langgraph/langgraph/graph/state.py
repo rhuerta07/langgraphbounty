@@ -29,11 +29,14 @@ from langchain_core.runnables import Runnable, RunnableConfig
 from langgraph.cache.base import BaseCache
 from langgraph.checkpoint.base import Checkpoint
 from langgraph.store.base import BaseStore
-from pydantic import BaseModel, TypeAdapter
+from pydantic import AliasChoices, AliasPath, BaseModel, ConfigDict, TypeAdapter
+from pydantic_core import PydanticUndefined
 from typing_extensions import NotRequired, Required, Self, Unpack, is_typeddict
 
 from langgraph._internal import _serde
 from langgraph._internal._constants import (
+    CONF,
+    CONFIG_KEY_TASK_ID,
     INTERRUPT,
     NS_END,
     NS_SEP,
@@ -1410,6 +1413,37 @@ class CompiledStateGraph(
     _output_mapper: Callable[[Any], Any] | None
     _state_mapper: Callable[[Any], Any] | None
 
+    def _prepare_graph_input(self, input: Any, config: RunnableConfig) -> Any:
+        if not isinstance(input, dict):
+            return input
+        # Nested graphs receive internal channel keys, not public input spellings.
+        if not self._input_aliases or CONFIG_KEY_TASK_ID in config.get(CONF, {}):
+            return input
+
+        schema = cast("type[BaseModel]", self.builder.input_schema)
+        validate_by_name = _pydantic_validate_by_name(schema)
+        ignored_names = set()
+        for name in self._input_aliases.keys() & input.keys():
+            alias = schema.model_fields[name].validation_alias
+            choices = alias.choices if isinstance(alias, AliasChoices) else (alias,)
+            # Pydantic tries validation aliases in order before falling back to
+            # a field name. A field name may itself be a named AliasChoices choice.
+            selected = next(
+                (
+                    choice
+                    for choice in choices
+                    if isinstance(choice, str) and choice in input
+                ),
+                None,
+            )
+            if selected != name and (selected is not None or not validate_by_name):
+                ignored_names.add(name)
+        if ignored_names:
+            return {
+                key: value for key, value in input.items() if key not in ignored_names
+            }
+        return input
+
     def __init__(
         self,
         *,
@@ -1420,6 +1454,7 @@ class CompiledStateGraph(
         super().__init__(**kwargs)
         self.builder = builder
         self.schema_to_mapper = schema_to_mapper
+        self._input_aliases = _simple_pydantic_aliases(builder.input_schema)
 
     def get_input_jsonschema(
         self, config: RunnableConfig | None = None
@@ -1454,6 +1489,15 @@ class CompiledStateGraph(
             ]
         # for membership checks, which run on every key of every node update
         output_key_set = frozenset(output_keys)
+        known_channels = frozenset(self.builder.channels) | frozenset(
+            self.builder.managed
+        )
+        input_aliases = self._input_aliases if key == START else {}
+        unsupported_input_aliases = (
+            _unsupported_pydantic_aliases(self.builder.input_schema, input_aliases)
+            if key == START
+            else {}
+        )
 
         def _get_updates(
             input: None | dict | Any,
@@ -1461,6 +1505,15 @@ class CompiledStateGraph(
             if input is None:
                 return None
             elif isinstance(input, dict):
+                _reject_unsupported_alias_updates(
+                    list(input.items()),
+                    unsupported_input_aliases,
+                    known_channels,
+                )
+                if input_aliases:
+                    input = dict(
+                        _normalize_alias_updates(list(input.items()), input_aliases)
+                    )
                 return [(k, v) for k, v in input.items() if k in output_key_set]
             elif isinstance(input, Command):
                 if input.graph == Command.PARENT:
@@ -1738,7 +1791,14 @@ def _pick_mapper(
 ) -> Callable[[Any], Any] | None:
     if state_keys == ["__root__"]:
         return None
-    if isclass(schema) and (issubclass(schema, BaseModel) or is_dataclass(schema)):
+    if isclass(schema) and issubclass(schema, BaseModel):
+        aliases = (
+            _simple_pydantic_aliases(schema)
+            if not _pydantic_validate_by_name(schema)
+            else {}
+        )
+        return partial(_coerce_state, schema, aliases=aliases)
+    if isclass(schema) and is_dataclass(schema):
         return partial(_coerce_state, schema)
     return None
 
@@ -1746,7 +1806,153 @@ def _pick_mapper(
 _S = TypeVar("_S")
 
 
-def _coerce_state(schema: type[_S], input: dict[str, Any]) -> _S:
+def _pydantic_validate_by_name(schema: type[BaseModel]) -> bool:
+    config = schema.model_config
+    value = (
+        config.get("validate_by_name")
+        if "validate_by_name" in ConfigDict.__annotations__
+        else None
+    )
+    return bool(config.get("populate_by_name", False) if value is None else value)
+
+
+def _unsupported_pydantic_aliases(
+    schema: type[Any], supported: dict[str, tuple[str, ...]]
+) -> dict[str, list[tuple[str, AliasPath | None]]]:
+    if not isclass(schema) or not issubclass(schema, BaseModel):
+        return {}
+    if (
+        "validate_by_alias" in ConfigDict.__annotations__
+        and schema.model_config.get("validate_by_alias") is False
+    ):
+        return {}
+    unsupported: dict[str, list[tuple[str, AliasPath | None]]] = {}
+    for name, field in schema.model_fields.items():
+        if name in supported:
+            continue
+        alias = field.validation_alias
+        choices = alias.choices if isinstance(alias, AliasChoices) else (alias,)
+        for choice in choices:
+            if isinstance(choice, str) and choice != name:
+                unsupported.setdefault(choice, []).append((name, None))
+            elif isinstance(choice, AliasPath) and isinstance(choice.path[0], str):
+                unsupported.setdefault(choice.path[0], []).append((name, choice))
+    return unsupported
+
+
+def _reject_unsupported_alias_updates(
+    updates: Sequence[tuple[str, Any]],
+    unsupported: dict[str, list[tuple[str, AliasPath | None]]],
+    channel_names: set[str] | frozenset[str],
+) -> None:
+    if not unsupported:
+        return
+    present = {key for key, _ in updates}
+    for key, value in updates:
+        if key in channel_names:
+            continue
+        for name, path in unsupported.get(key, ()):
+            if name not in present and (
+                path is None
+                or path.search_dict_for_path({key: value}) is not PydanticUndefined
+            ):
+                raise InvalidUpdateError(
+                    f"Cannot safely apply Pydantic validation alias {key!r} "
+                    "for this graph schema"
+                )
+
+
+def _simple_pydantic_aliases(schema: type[Any]) -> dict[str, tuple[str, ...]]:
+    """Find string aliases that can be translated without losing channel data."""
+    if not isclass(schema) or not issubclass(schema, BaseModel):
+        return {}
+    fields = schema.model_fields
+    if not any(field.validation_alias is not None for field in fields.values()):
+        return {}
+    config = schema.model_config
+    if (
+        "validate_by_alias" in ConfigDict.__annotations__
+        and config.get("validate_by_alias") is False
+    ):
+        return {}
+    for base in schema.__mro__:
+        if base is BaseModel:
+            break
+        if "__get_pydantic_core_schema__" in base.__dict__:
+            return {}
+    # Input-sensitive validators and custom constructors may distinguish
+    # an alias from a field name after the source spelling is lost.
+    decorators = schema.__pydantic_decorators__
+    if schema.__pydantic_custom_init__ or any(
+        validator.info.mode in ("before", "wrap")
+        for validator in (
+            *decorators.model_validators.values(),
+            *decorators.root_validators.values(),
+        )
+    ):
+        return {}
+    channel_names = get_type_hints(schema, include_extras=True)
+    aliases: dict[str, tuple[str, ...]] = {}
+    used_aliases: set[str] = set()
+    for name, field in fields.items():
+        alias = field.validation_alias
+        if alias is None or alias == name:
+            continue
+        if isinstance(alias, str):
+            choices = (alias,)
+        elif isinstance(alias, AliasChoices) and all(
+            isinstance(choice, str) for choice in alias.choices
+        ):
+            choices = tuple(alias.choices)
+        else:
+            return {}
+        if len(set(choices)) != len(choices):
+            return {}
+        choices = tuple(choice for choice in choices if choice != name)
+        if not choices:
+            continue
+        if any(choice in channel_names or choice in used_aliases for choice in choices):
+            return {}
+        used_aliases.update(choices)
+        aliases[name] = choices
+    return aliases
+
+
+def _normalize_alias_updates(
+    updates: Sequence[tuple[str, Any]], aliases: dict[str, tuple[str, ...]]
+) -> list[tuple[str, Any]]:
+    present = {name for name, _ in updates}
+    selected: dict[str, str] = {}
+    all_aliases: dict[str, str] = {}
+    for name, choices in aliases.items():
+        all_aliases.update((alias, name) for alias in choices)
+        if name not in present:
+            for alias in choices:
+                if alias in present:
+                    selected[name] = alias
+                    break
+    return [
+        (all_aliases.get(key, key), value)
+        for key, value in updates
+        if key not in all_aliases or selected.get(all_aliases[key]) == key
+    ]
+
+
+def _coerce_state(
+    schema: type[_S],
+    input: dict[str, Any],
+    *,
+    aliases: dict[str, tuple[str, ...]] | None = None,
+) -> _S:
+    if aliases:
+        input = dict(input)
+        for choices in aliases.values():
+            for alias in choices:
+                input.pop(alias, None)
+        input = {
+            aliases[key][0] if key in aliases else key: value
+            for key, value in input.items()
+        }
     return schema(**input)
 
 

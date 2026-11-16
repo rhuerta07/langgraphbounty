@@ -1216,6 +1216,9 @@ class Pregel(
     _output_mapper: Callable[[Any], Any] | None = None
     _state_mapper: Callable[[Any], Any] | None = None
 
+    def _prepare_graph_input(self, input: Any, config: RunnableConfig) -> Any:
+        return input
+
     def _migrate_checkpoint(self, checkpoint: Checkpoint) -> None:
         """Migrate a saved checkpoint to new channel layout."""
         if checkpoint["v"] < 4 and checkpoint.get("pending_sends"):
@@ -3010,7 +3013,7 @@ class Pregel(
                         )
 
             with SyncPregelLoop(
-                input,
+                self._prepare_graph_input(input, config),
                 stream=StreamProtocol(stream.put, stream_modes),
                 config=config,
                 store=store,
@@ -3460,7 +3463,7 @@ class Pregel(
                         )
 
             async with AsyncPregelLoop(
-                input,
+                self._prepare_graph_input(input, config),
                 stream=StreamProtocol(stream.put_nowait, stream_modes),
                 config=config,
                 store=store,

@@ -16,9 +16,11 @@ import pydantic
 import pytest
 import typing_extensions
 from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import (
     BaseModel,
     ByteSize,
+    ConfigDict,
     Field,
     SecretStr,
     confloat,
@@ -31,6 +33,7 @@ from pydantic import (
 
 from langgraph._internal._pydantic import create_model, is_supported_by_pydantic
 from langgraph.constants import END, START
+from langgraph.errors import InvalidUpdateError
 from langgraph.func import entrypoint, task
 from langgraph.graph.state import StateGraph
 from langgraph.types import Command, Interrupt, interrupt
@@ -481,3 +484,281 @@ def test_interrupt_functional_pydantic(sync_checkpointer: BaseCheckpointSaver) -
     res = graph.invoke(Command(resume="bar"), config)
     assert res == {"a": "foobar", "b": "bar"}
     assert called_count == 1
+
+
+def test_aliased_pydantic_graph_input_and_checkpoint() -> None:
+    class State(BaseModel):
+        foo: str = Field(alias="bar")
+
+        @field_validator("foo")
+        @classmethod
+        def validate_foo(cls, value: str) -> str:
+            if value == "invalid":
+                raise ValueError("invalid foo")
+            return value
+
+    seen = []
+
+    def node(state: State):
+        seen.append(state.foo)
+        return None
+
+    builder = StateGraph(State)
+    builder.add_node("node", node)
+    builder.add_edge(START, "node")
+    graph = builder.compile(checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": "alias-test"}}
+    assert graph.invoke({"bar": "hello"}, config) == {"foo": "hello"}
+    assert seen == ["hello"]
+    assert graph.get_state(config).values == {"foo": "hello"}
+    with pytest.raises(pydantic.ValidationError, match="invalid foo"):
+        graph.invoke({"bar": "invalid"}, {"configurable": {"thread_id": "invalid"}})
+
+
+def test_pydantic_shared_alias_preserves_canonical_state() -> None:
+    class State(BaseModel):
+        model_config = ConfigDict(populate_by_name=True)
+        a: int = Field(alias="shared")
+        b: int = Field(alias="shared")
+
+    seen = []
+
+    def node(state: State):
+        seen.append(state.model_dump())
+        return None
+
+    builder = StateGraph(State)
+    builder.add_node("node", node)
+    builder.add_edge(START, "node")
+    assert builder.compile().invoke({"a": 1, "b": 2}) == {"a": 1, "b": 2}
+    assert seen == [{"a": 1, "b": 2}]
+
+
+def test_aliased_pydantic_input_respects_name_validation() -> None:
+    class AliasOnly(BaseModel):
+        foo: str = Field(alias="bar")
+
+    class AliasOrName(BaseModel):
+        model_config = ConfigDict(populate_by_name=True)
+        foo: str = Field(alias="bar")
+
+    class NameOnly(BaseModel):
+        model_config = ConfigDict(validate_by_alias=False, validate_by_name=True)
+        foo: str = Field(alias="bar")
+
+    def graph_for(schema):
+        builder = StateGraph(schema)
+        builder.add_node("node", lambda state: None)
+        builder.add_edge(START, "node")
+        return builder.compile()
+
+    with pytest.raises(pydantic.ValidationError, match="bar"):
+        graph_for(AliasOnly).invoke({"foo": "hello"})
+    assert graph_for(AliasOnly).invoke({"foo": "name", "bar": "alias"}) == {
+        "foo": "alias"
+    }
+    assert graph_for(AliasOrName).invoke({"foo": "hello"}) == {"foo": "hello"}
+    if "validate_by_alias" in ConfigDict.__annotations__:
+        assert graph_for(NameOnly).invoke({"foo": "hello"}) == {"foo": "hello"}
+        with pytest.raises(pydantic.ValidationError, match="foo"):
+            graph_for(NameOnly).invoke({"bar": "hello"})
+    else:
+        # Pydantic versions before 2.11 ignore the newer validation options.
+        assert graph_for(NameOnly).invoke({"bar": "hello"}) == {"foo": "hello"}
+        with pytest.raises(pydantic.ValidationError, match="bar"):
+            graph_for(NameOnly).invoke({"foo": "hello"})
+    assert graph_for(AliasOrName).invoke({"foo": "name", "bar": "alias"}) == {
+        "foo": "alias"
+    }
+
+
+def test_defaulted_alias_only_field_keeps_checkpoint_keys_canonical() -> None:
+    class State(BaseModel):
+        foo: int = Field(default=0, alias="wire")
+
+    seen = []
+
+    def node(state: State):
+        seen.append(state.foo)
+        return None
+
+    builder = StateGraph(State)
+    builder.add_node("node", node)
+    builder.add_edge(START, "node")
+    saver = InMemorySaver()
+    graph = builder.compile(checkpointer=saver)
+    config = {"configurable": {"thread_id": "defaulted-alias-field"}}
+
+    assert graph.invoke({"foo": 9}, config) is None
+    assert seen == [0]
+    assert graph.get_state(config).values == {}
+    checkpoint = saver.get(config)
+    assert checkpoint is not None
+    assert "foo" not in checkpoint["channel_values"]
+    assert "wire" not in checkpoint["channel_values"]
+
+    assert graph.invoke({"wire": 7}, config) == {"foo": 7}
+    assert graph.get_state(config).values == {"foo": 7}
+
+    assert graph.invoke({"foo": 9}, config) is None
+    assert seen == [0, 7, 7]
+    assert graph.get_state(config).values == {"foo": 7}
+    checkpoint = saver.get(config)
+    assert checkpoint is not None
+    assert checkpoint["channel_values"]["foo"] == 7
+    assert "wire" not in checkpoint["channel_values"]
+
+
+def test_aliased_subgraph_accepts_canonical_parent_state() -> None:
+    class ChildState(BaseModel):
+        foo: int = Field(alias="wire")
+
+    class ParentState(typing_extensions.TypedDict):
+        foo: int
+
+    child = StateGraph(ChildState)
+    child.add_node("increment", lambda state: {"foo": state.foo + 1})
+    child.add_edge(START, "increment")
+
+    parent = StateGraph(ParentState)
+    parent.add_node("child", child.compile())
+    parent.add_edge(START, "child")
+    assert parent.compile().invoke({"foo": 1}) == {"foo": 2}
+
+
+def test_aliased_input_schema_keeps_canonical_channels() -> None:
+    class Input(BaseModel):
+        foo: str = Field(alias="bar")
+
+    class State(typing_extensions.TypedDict):
+        foo: str
+
+    seen = []
+
+    def node(state: State):
+        seen.append(state["foo"])
+        return None
+
+    builder = StateGraph(State, input_schema=Input)
+    builder.add_node("node", node)
+    builder.add_edge(START, "node")
+    assert builder.compile().invoke({"bar": "hello"}) == {"foo": "hello"}
+    assert seen == ["hello"]
+
+
+def test_aliased_pydantic_separate_schemas_and_stream() -> None:
+    class Input(BaseModel):
+        foo: str = Field(alias="request_foo")
+
+    class State(BaseModel):
+        foo: str = Field(alias="state_foo")
+
+    class Output(BaseModel):
+        foo: str = Field(alias="response_foo")
+
+    observed = []
+
+    def node(state: State):
+        observed.append(state.foo)
+        return None
+
+    builder = StateGraph(State, input_schema=Input, output_schema=Output)
+    builder.add_node("node", node)
+    builder.add_edge(START, "node")
+    graph = builder.compile()
+    assert list(graph.stream({"request_foo": "hello"}, stream_mode="values")) == [
+        {"foo": "hello"}
+    ]
+    assert observed == ["hello"]
+    assert graph.invoke({"request_foo": "hello"}, version="v2").value.foo == "hello"
+
+
+def test_aliased_pydantic_alias_generator() -> None:
+    class State(BaseModel):
+        model_config = ConfigDict(alias_generator=str.upper)
+        foo: str
+
+    builder = StateGraph(State)
+    builder.add_node("node", lambda state: None)
+    builder.add_edge(START, "node")
+    assert builder.compile().invoke({"FOO": "hello"}) == {"foo": "hello"}
+
+
+@pytest.mark.asyncio
+async def test_aliased_pydantic_async_and_resume() -> None:
+    class State(BaseModel):
+        foo: str = Field(alias="bar")
+
+    seen = []
+
+    def node(state: State):
+        seen.append(state.foo)
+        return None
+
+    builder = StateGraph(State)
+    builder.add_node("node", node)
+    builder.add_edge(START, "node")
+    graph = builder.compile(checkpointer=InMemorySaver(), interrupt_before=["node"])
+    config = {"configurable": {"thread_id": "async-alias"}}
+    events = [
+        event
+        async for event in graph.astream(
+            {"foo": "ignored", "bar": "hello"}, config, stream_mode="values"
+        )
+    ]
+    assert events == [{"foo": "hello"}]
+    assert (await graph.aget_state(config)).values == {"foo": "hello"}
+    await graph.ainvoke(None, config)
+    assert seen == ["hello"]
+
+
+def test_aliased_pydantic_name_and_before_validator_preserves_existing_behavior() -> (
+    None
+):
+    class State(BaseModel):
+        model_config = ConfigDict(populate_by_name=True)
+        foo: int = Field(alias="bar")
+
+        @model_validator(mode="before")
+        @classmethod
+        def validate_input(cls, value):
+            if "foo" in value:
+                return value | {"foo": value["foo"] + 1}
+            return value
+
+    seen = []
+
+    def node(state: State):
+        seen.append(state.foo)
+        return None
+
+    builder = StateGraph(State)
+    builder.add_node("node", node)
+    builder.add_edge(START, "node")
+    graph = builder.compile()
+    assert graph.invoke({"foo": 1}) == {"foo": 1}
+    assert seen == [2]
+    with pytest.raises(InvalidUpdateError, match="bar"):
+        graph.invoke({"bar": 1})
+
+
+def test_aliased_checkpoint_stream_ignores_other_channel_collision() -> None:
+    class State(BaseModel):
+        foo: int = Field(alias="bar")
+
+    class Extra(typing_extensions.TypedDict):
+        bar: int
+
+    builder = StateGraph(State)
+    builder.add_node("extra", lambda state: {"bar": 99}, input_schema=Extra)
+    builder.add_edge(START, "extra")
+    graph = builder.compile(checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": "alias-collision"}}
+    graph.invoke({"bar": 5}, config)
+    assert graph.get_state(config).values == {"foo": 5, "bar": 99}
+    events = list(graph.stream(None, config, stream_mode="checkpoints", version="v2"))
+    values = [
+        event["data"]["values"] for event in events if event["data"].get("values")
+    ]
+    assert values
+    assert all(value.foo == 5 for value in values)
