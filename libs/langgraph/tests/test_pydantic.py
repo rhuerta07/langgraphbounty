@@ -684,7 +684,7 @@ def test_aliased_pydantic_alias_generator() -> None:
     assert builder.compile().invoke({"FOO": "hello"}) == {"foo": "hello"}
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_aliased_pydantic_async_and_resume() -> None:
     class State(BaseModel):
         foo: str = Field(alias="bar")
